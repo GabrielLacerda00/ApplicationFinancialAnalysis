@@ -4,3 +4,6 @@ pandas
 plotly
 ta
 scikit-learn
+xgboost
+pmdarima
+prophet

@@ -13,7 +13,7 @@ Aplicação web interativa construída com **Streamlit** para análise técnica 
 ---
 ## 🧭 Visão Geral
 
-O **Inteligência Financeira** permite que o usuário selecione uma empresa listada em bolsa (Apple, Google, Microsoft, Tesla, Netflix, Meta), visualize indicadores técnicos clássicos sobre o histórico de preços e gere previsões de curto prazo utilizando um modelo de regressão linear treinado sobre os próprios dados históricos do ativo.
+O **Inteligência Financeira** permite que o usuário selecione uma empresa listada em bolsa (Apple, Google, Microsoft, Tesla, Netflix, Meta), visualize indicadores técnicos clássicos sobre o histórico de preços e gere previsões de curto prazo comparando **5 modelos preditivos diferentes**, do clássico ao mais robusto.
 
 A aplicação é dividida em três páginas principais, navegáveis pela barra lateral:
 
@@ -21,13 +21,13 @@ A aplicação é dividida em três páginas principais, navegáveis pela barra l
 |---|---|
 | 📊 **Gráficos** | Visualização de indicadores técnicos (Bollinger, MACD, RSI, SMA, EMA) |
 | 🗂️ **Tabela de Dados** | Últimos registros do período selecionado em formato tabular |
-| 🔮 **Previsões** | Previsão de preços futuros via Regressão Linear |
+| 🔮 **Previsões** | Previsão de preços futuros com 5 modelos selecionáveis |
 
 ---
 
 ## ✨ Funcionalidades
 
-- **Seleção de ativo** entre 6 grandes empresas de tecnologia (facilmente extensível)
+- **Seleção de ativo** entre 6 grandes empresas de tecnologia (facilmente extensível via dicionário `TICKERS`)
 - **Período customizável** de coleta de dados via calendário na sidebar
 - **Cache inteligente** dos dados baixados (1 hora de TTL) para evitar chamadas repetidas à API
 - **Métricas em tempo real**: último fechamento, variação percentual, volume, máxima e mínima do período
@@ -38,7 +38,11 @@ A aplicação é dividida em três páginas principais, navegáveis pela barra l
   - RSI (Relative Strength Index)
   - Média Móvel Simples (SMA)
   - Média Móvel Exponencial (EMA)
-- **Modelo preditivo** de Regressão Linear com padronização dos dados (`StandardScaler`) e avaliação via **R²**
+- **5 modelos de previsão selecionáveis**, cada um avaliado com a métrica mais adequada ao seu comportamento:
+  - **Regressão Linear**, **Random Forest** e **XGBoost** — avaliados com split treino/teste 80/20 e dados padronizados (`StandardScaler`)
+  - **Prophet** — avaliado com **validação cruzada temporal (walk-forward)**, testando o modelo em múltiplas janelas ao longo do histórico (RMSE e MAPE médios), com fallback para split simples quando o histórico é curto
+  - **ARIMA** — ordem `(p, d, q)` selecionada automaticamente via `pmdarima.auto_arima` (menor AIC), avaliado com split temporal simples
+- Todos os modelos reportam **R² Score** e exibem o gráfico histórico x previsão lado a lado com a tabela de valores projetados
 - **Gráficos interativos** com Plotly, em tema escuro, responsivos e com legendas horizontais
 - **Interface customizada** com CSS injetado para cards de métricas mais elegantes
 
@@ -52,7 +56,9 @@ A aplicação é dividida em três páginas principais, navegáveis pela barra l
 | Dados de mercado | [yfinance](https://pypi.org/project/yfinance/) |
 | Visualização | [Plotly](https://plotly.com/python/) |
 | Indicadores técnicos | [ta](https://technical-analysis-library-in-python.readthedocs.io/) |
-| Machine Learning | [scikit-learn](https://scikit-learn.org/) (Regressão Linear) |
+| Machine Learning (tabular) | [scikit-learn](https://scikit-learn.org/) (Regressão Linear, Random Forest) |
+| Machine Learning (boosting) | [XGBoost](https://xgboost.readthedocs.io/) |
+| Séries temporais | [Prophet](https://facebook.github.io/prophet/) · [pmdarima](https://alkaline-ml.com/pmdarima/) (ARIMA) |
 | Manipulação de dados | [pandas](https://pandas.pydata.org/) |
 
 ---
@@ -61,9 +67,10 @@ A aplicação é dividida em três páginas principais, navegáveis pela barra l
 
 ```
 .
-├── app.py              # Aplicação principal (Streamlit)
-├── requirements.txt     # Dependências do projeto
-└── README.md            # Este arquivo
+├── app.py                          # Aplicação principal (Streamlit)
+├── InteligenciaFinanceira.ipynb    # Notebook de exploração e prototipagem
+├── requirements.txt                # Dependências do projeto
+└── README.md                       # Este arquivo
 ```
 
 ---
@@ -100,6 +107,9 @@ pandas
 plotly
 ta
 scikit-learn
+xgboost
+pmdarima
+prophet
 ```
 
 ### 4. Execute a aplicação
@@ -124,21 +134,23 @@ Calculados com a biblioteca `ta` a partir da série de preços de fechamento:
 - **RSI**: oscila entre 0–100; valores acima de 70 costumam indicar sobrecompra, abaixo de 30, sobrevenda
 - **SMA / EMA**: suavizam a série de preços para identificar tendências
 
-### Modelo de Previsão
-O modelo utiliza **Regressão Linear** (`sklearn.linear_model.LinearRegression`) treinado sobre o preço de fechamento histórico:
+### Modelos de Previsão
+O usuário escolhe o modelo na página de Previsões. Cada modelo é treinado sob demanda:
 
-1. A coluna `target` é criada deslocando (`shift`) o preço de fechamento `N` dias para trás, criando o rótulo a ser previsto
-2. Os dados são divididos em treino/teste (80/20) e padronizados com `StandardScaler`
-3. O modelo é avaliado com **R² Score** sobre o conjunto de teste
-4. Após treinado, o modelo gera a previsão para os próximos `N` dias úteis (`pd.bdate_range`)
+1. **Regressão Linear, Random Forest e XGBoost**: usam o preço de fechamento como feature, com o alvo (`target`) criado deslocando (`shift`) a série `N` dias para trás. Dados divididos em treino/teste (80/20) e padronizados com `StandardScaler`.
+2. **Prophet**: treinado sobre a série temporal completa (`ds`/`y`). A acurácia é calculada por **validação cruzada temporal (walk-forward)** — o modelo é testado em várias janelas ao longo do histórico, reduzindo a chance do R² ser distorcido por uma única quebra de tendência cair na janela de teste. Quando o histórico é curto demais, cai automaticamente para um split simples 80/20.
+3. **ARIMA**: os parâmetros `(p, d, q)` são escolhidos automaticamente pelo `auto_arima` (menor AIC), evitando ajuste manual da ordem do modelo.
 
-> ⚠️ **Aviso**: este modelo tem propósito educacional/demonstrativo. Regressão linear simples sobre preço histórico **não constitui recomendação de investimento** e não deve ser utilizada como única base para decisões financeiras.
+Em todos os casos, após a validação o modelo é re-treinado (quando aplicável) e gera a previsão para os próximos `N` dias úteis (`pd.bdate_range`), exibida em tabela e em gráfico comparando histórico x previsão.
+
+> ⚠️ **Aviso**: este modelo tem propósito educacional/demonstrativo. As previsões geradas **não constituem recomendação de investimento** e não devem ser utilizadas como única base para decisões financeiras.
 
 ---
 
 ## 🎨 Personalização
 
 - Novos ativos podem ser adicionados facilmente ao dicionário `TICKERS` no início do arquivo
+- Novos modelos scikit-learn-like podem ser adicionados ao dicionário `MODELOS_SKLEARN` sem alterar a lógica de treino
 - As cores da interface (`COR_PRIMARIA`, `COR_SECUNDARIA`, `COR_NEUTRA`) podem ser ajustadas para outros temas
 - Novos indicadores técnicos podem ser incluídos seguindo o padrão das funções em `indicadores_tecnicos()`
 
@@ -147,9 +159,9 @@ O modelo utiliza **Regressão Linear** (`sklearn.linear_model.LinearRegression`)
 ## 📌 Possíveis Melhorias Futuras
 
 - [ ] Adicionar suporte a busca livre de tickers (não apenas lista fixa)
-- [ ] Incluir outros modelos preditivos (ARIMA, Prophet, LSTM) para comparação
 - [ ] Adicionar backtesting de estratégias baseadas nos indicadores
 - [ ] Persistir previsões e histórico de acurácia do modelo
+- [ ] Comparar todos os modelos lado a lado em uma única tela
 - [ ] Deploy em Streamlit Cloud / Docker
 
 ---

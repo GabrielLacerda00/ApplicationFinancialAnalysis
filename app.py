@@ -3,13 +3,18 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+import pmdarima as pm
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 from ta.trend import MACD, EMAIndicator, SMAIndicator
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
 from sklearn.metrics import r2_score
+from prophet import Prophet
+from prophet.diagnostics import cross_validation, performance_metrics
 
 
 st.set_page_config(
@@ -43,6 +48,18 @@ TICKERS = {
     "APPLE": "AAPL", "GOOGLE": "GOOG", "MICROSOFT": "MSFT",
     "TESLA": "TSLA", "NETFLIX": "NFLX", "META": "META",
 }
+
+# Modelos de previsão disponíveis. Adicione novos modelos aqui sem precisar
+# alterar a lógica de treino/previsão — exceto Prophet e ARIMA, que seguem
+# APIs próprias (não são scikit-learn) e por isso são tratados separadamente
+# dentro de gerando_previsoes().
+MODELOS_SKLEARN = {
+    "Regressão Linear": LinearRegression(),
+    "Random Forest": RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42),
+    "XGBoost": XGBRegressor(n_estimators=300, max_depth=4, learning_rate=0.05, random_state=42),
+}
+
+NOMES_MODELOS = list(MODELOS_SKLEARN.keys()) + ["Prophet", "ARIMA"]
 
 
 st.sidebar.markdown("## 📈 Inteligência Financeira")
@@ -185,7 +202,10 @@ def imprime_tabela():
         width='stretch',
     )
 
-def gerando_previsoes(num):
+
+def _prever_sklearn(num, nome_modelo):
+    """Treina e prevê usando um dos modelos scikit-learn (regressão tabular
+    clássica: usa o preço de fechamento como única feature)."""
     df = df_dados[["Close"]].copy()
     df["target"] = df["Close"].shift(-num)
 
@@ -200,7 +220,8 @@ def gerando_previsoes(num):
     x_treino_padronizado = padronizador.fit_transform(x_treino)
     x_teste_padronizado = padronizador.transform(x_teste)
 
-    modelo = LinearRegression().fit(x_treino_padronizado, y_treino)
+    modelo = MODELOS_SKLEARN[nome_modelo]
+    modelo.fit(x_treino_padronizado, y_treino)
     previsoes_teste = modelo.predict(x_teste_padronizado)
     acuracia = r2_score(y_teste, previsoes_teste)
 
@@ -208,10 +229,151 @@ def gerando_previsoes(num):
     x_forecast_padronizado = padronizador.transform(x_forecast)
     forecast = modelo.predict(x_forecast_padronizado)
 
-    st.metric("Acurácia do Modelo (R²)", f"{acuracia:.3f}")
+    datas_futuras = pd.bdate_range(start=df_dados.index[-1], periods=num + 1)[1:]
+    df_forecast = pd.DataFrame({"Data": datas_futuras, "Previsão": forecast})
+    return df_forecast, acuracia
+
+
+def _prever_prophet(num):
+    """Treina e prevê usando Prophet, avaliando com validação cruzada
+    temporal (walk-forward) via prophet.diagnostics.cross_validation.
+
+    A validação cruzada testa o modelo em VÁRIAS janelas de teste ao longo
+    do histórico (não só uma), o que dá uma métrica muito mais confiável
+    do que um único split 80/20 — reduz a chance de o R² ser distorcido
+    por uma única quebra de tendência (ex.: uma queda abrupta) cair
+    justamente na janela de teste.
+
+    Se o histórico for curto demais para gerar pelo menos duas janelas de
+    validação, cai de volta para o split temporal simples 80/20.
+    """
+    df_prophet = df_dados.reset_index()[["Date", "Close"]].rename(
+        columns={"Date": "ds", "Close": "y"}
+    )
+    # yfinance retorna datas com timezone; Prophet exige datas "naive"
+    df_prophet["ds"] = pd.to_datetime(df_prophet["ds"]).dt.tz_localize(None)
+
+    total_dias = len(df_prophet)
+    horizon_dias = num
+
+    # "initial": tamanho da primeira janela de treino
+    # "period": de quanto em quanto tempo um novo corte de validação é feito
+    initial_dias = max(int(total_dias * 0.5), horizon_dias * 3)
+    period_dias = max(horizon_dias // 2, 1)
+
+    modelo_final = Prophet(daily_seasonality=False)
+    modelo_final.fit(df_prophet)
+
+    acuracia = None
+    metricas_cv = None
+
+    # Só tenta validação cruzada se sobrar histórico para pelo menos
+    # duas janelas de teste após o treino inicial
+    if total_dias - initial_dias >= horizon_dias * 2:
+        try:
+            df_cv = cross_validation(
+                modelo_final,
+                initial=f"{initial_dias} days",
+                period=f"{period_dias} days",
+                horizon=f"{horizon_dias} days",
+                parallel=None,
+                disable_tqdm=True,
+            )
+            acuracia = r2_score(df_cv["y"], df_cv["yhat"])
+            metricas_cv = performance_metrics(df_cv, rolling_window=1)
+        except Exception:
+            acuracia = None
+
+    if acuracia is None:
+        # Fallback: histórico insuficiente para validação cruzada robusta
+        corte = int(len(df_prophet) * 0.8)
+        treino, teste = df_prophet.iloc[:corte], df_prophet.iloc[corte:]
+        modelo_validacao = Prophet(daily_seasonality=False)
+        modelo_validacao.fit(treino)
+        previsao_teste = modelo_validacao.predict(teste[["ds"]])
+        acuracia = r2_score(teste["y"].values, previsao_teste["yhat"].values)
+
+    futuro = modelo_final.make_future_dataframe(periods=num, freq="B")
+    forecast_completo = modelo_final.predict(futuro)
+    forecast = forecast_completo.tail(num)
+
+    df_forecast = pd.DataFrame({
+        "Data": forecast["ds"].values,
+        "Previsão": forecast["yhat"].values,
+    })
+    return df_forecast, acuracia, metricas_cv
+
+
+def _prever_arima(num):
+    """Treina e prevê usando ARIMA, com seleção automática dos parâmetros
+    (p, d, q) via pmdarima.auto_arima — evita ter que escolher a ordem do
+    modelo manualmente (o auto_arima testa várias combinações e fica com a
+    de menor AIC).
+
+    Avaliação por split temporal simples (80% treino / 20% teste, sem
+    embaralhar): reajustar o ARIMA repetidamente numa validação cruzada
+    walk-forward (como no Prophet) ficaria pesado demais para um app
+    interativo, já que cada refit busca os parâmetros do zero.
+    """
+    close = df_dados["Close"]
+
+    corte = int(len(close) * 0.8)
+    treino, teste = close.iloc[:corte], close.iloc[corte:]
+
+    if len(treino) < 10 or len(teste) < 1:
+        raise ValueError("Poucos dados para treinar o ARIMA. Amplie o período selecionado.")
+
+    modelo_validacao = pm.auto_arima(
+        treino, seasonal=False, suppress_warnings=True, error_action="ignore"
+    )
+    previsao_teste = modelo_validacao.predict(n_periods=len(teste))
+    acuracia = r2_score(teste.values, previsao_teste)
+
+    # Refaz o auto_arima com TODO o histórico para gerar a previsão final
+    modelo_final = pm.auto_arima(
+        close, seasonal=False, suppress_warnings=True, error_action="ignore"
+    )
+    forecast = modelo_final.predict(n_periods=num)
 
     datas_futuras = pd.bdate_range(start=df_dados.index[-1], periods=num + 1)[1:]
     df_forecast = pd.DataFrame({"Data": datas_futuras, "Previsão": forecast})
+    return df_forecast, acuracia
+
+
+def gerando_previsoes(num, nome_modelo):
+    metricas_cv = None
+    if nome_modelo == "Prophet":
+        df_forecast, acuracia, metricas_cv = _prever_prophet(num)
+    elif nome_modelo == "ARIMA":
+        df_forecast, acuracia = _prever_arima(num)
+    else:
+        df_forecast, acuracia = _prever_sklearn(num, nome_modelo)
+
+    st.metric(f"Acurácia do Modelo — {nome_modelo} (R²)", f"{acuracia:.3f}")
+
+    if nome_modelo == "Prophet":
+        if metricas_cv is not None:
+            rmse_medio = metricas_cv["rmse"].mean()
+            mape_medio = metricas_cv["mape"].mean() * 100
+            st.caption(
+                f"R² calculado via **validação cruzada temporal (walk-forward)** — "
+                f"RMSE médio de ${rmse_medio:,.2f} · MAPE médio de {mape_medio:.2f}% "
+                f"ao longo de múltiplas janelas de teste."
+            )
+        else:
+            st.caption(
+                "Histórico insuficiente para validação cruzada robusta "
+                "(poucas janelas de teste disponíveis) — R² calculado com "
+                "split temporal simples (80% treino / 20% teste). "
+                "Aumente o período de dados na barra lateral para uma "
+                "avaliação mais confiável."
+            )
+    elif nome_modelo == "ARIMA":
+        st.caption(
+            "R² calculado com **split temporal simples** (80% treino / 20% "
+            "teste, sem embaralhar) — ordem (p,d,q) escolhida automaticamente "
+            "pelo `auto_arima`."
+        )
 
     col1, col2 = st.columns([1, 1.4])
     with col1:
@@ -226,7 +388,7 @@ def gerando_previsoes(num):
         fig.add_trace(go.Scatter(x=df_forecast["Data"], y=df_forecast["Previsão"], name="Previsão",
                                   line=dict(color=COR_PRIMARIA, dash="dash"), mode="lines+markers"))
         fig.update_layout(
-            title="Histórico x Previsão", template="plotly_dark",
+            title=f"Histórico x Previsão ({nome_modelo})", template="plotly_dark",
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
             margin=dict(l=10, r=10, t=60, b=10), height=380,
@@ -236,10 +398,16 @@ def gerando_previsoes(num):
 
 def previsoes():
     st.subheader("Previsões")
-    num = st.number_input("Prever quantos dias à frente?", value=1, min_value=1, step=1)
+
+    col1, col2 = st.columns([1.4, 1])
+    with col1:
+        nome_modelo = st.selectbox("Modelo de previsão", NOMES_MODELOS)
+    with col2:
+        num = st.number_input("Prever quantos dias à frente?", value=1, min_value=1, step=1)
+
     if st.button("Gerar Previsão", type="primary"):
-        with st.spinner("Treinando modelo..."):
-            gerando_previsoes(int(num))
+        with st.spinner(f"Treinando modelo ({nome_modelo})..."):
+            gerando_previsoes(int(num), nome_modelo)
 
 
 
